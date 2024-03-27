@@ -1,0 +1,728 @@
+drop table tempA;
+create temporary table tempA as
+SELECT
+  patientid AS patient_id,
+  p4pmeasure,
+  resultstatus AS result_status,
+  contextid
+FROM
+  analytics.dbo.diabetes_athena_extract ---Pete's team
+WHERE
+  p4pmeasure IN (
+    'Eye Exam for Patients with Diabetes (EED) (Adjusted, Uncertified)',
+    'Blood Pressure Control for Patients With Diabetes (BPD) (Adjusted, Uncertified)',
+    'Kidney Health Evaluation for patients with diabetes (KED) (Adjusted, Uncertified)',
+    'Glycemic Status Assessment for Patients With Diabetes: Glycemic Status <8% (GSD1) (Adjusted, Uncertified)'
+  );
+      
+
+drop table tempB;
+create temporary table tempB as
+select distinct *
+       from "TEMPA"
+PIVOT
+(max(result_status) for p4pmeasure
+ in ('Glycemic Status Assessment for Patients With Diabetes: Glycemic Status <8% (GSD1) (Adjusted, Uncertified)', 'Eye Exam for Patients with Diabetes (EED) (Adjusted, Uncertified)'
+     ,'Kidney Health Evaluation for patients with diabetes (KED) (Adjusted, Uncertified)'
+    ,'Blood Pressure Control for Patients With Diabetes (BPD) (Adjusted, Uncertified)')) as T    
+
+
+drop table tempC;
+CREATE LOCAL TEMPORARY TABLE "tempc" AS
+SELECT
+  "patient_id",
+  contextid,
+  "'Blood Pressure Control for Patients With Diabetes (BPD) (Adjusted, Uncertified)'" AS BP,
+  CASE
+    WHEN "'Eye Exam for Patients with Diabetes (EED) (Adjusted, Uncertified)'" = 'Out of Range' THEN 'Needs Data'
+    ELSE "'Eye Exam for Patients with Diabetes (EED) (Adjusted, Uncertified)'"
+  END AS EyeExam,
+  CASE
+    WHEN "'Kidney Health Evaluation for patients with diabetes (KED) (Adjusted, Uncertified)'" = 'Excluded' THEN 'Satisfied'
+    ELSE "'Kidney Health Evaluation for patients with diabetes (KED) (Adjusted, Uncertified)'"
+  END AS Kidney,
+  "'Glycemic Status Assessment for Patients With Diabetes: Glycemic Status <8% (GSD1) (Adjusted, Uncertified)'" AS HbA1C   
+FROM
+  "tempb"
+WHERE
+  "'Glycemic Status Assessment for Patients With Diabetes: Glycemic Status <8% (GSD1) (Adjusted, Uncertified)'" <> 'NULL'
+  AND "'Kidney Health Evaluation for patients with diabetes (KED) (Adjusted, Uncertified)'" <> 'NULL'
+  AND "'Blood Pressure Control for Patients With Diabetes (BPD) (Adjusted, Uncertified)'" <> 'NULL'
+  AND "'Eye Exam for Patients with Diabetes (EED) (Adjusted, Uncertified)'" <> 'NULL'
+
+
+DROP TABLE  "tempd";    
+CREATE LOCAL TEMPORARY TABLE "tempd" AS
+SELECT
+  *,
+  CASE
+    WHEN Kidney <> 'Needs Data'
+    AND EyeExam <> 'Needs Data'
+    AND HbA1C <> 'Needs Data'
+    AND BP <> 'Needs Data' THEN '1'
+    ELSE '0'
+  END AS "Bundled Complete",
+  CASE
+    WHEN BP = 'Satisfied'
+    AND EyeExam = 'Satisfied'
+    AND Kidney = 'Satisfied'
+    AND HbA1C = 'Satisfied' THEN '1'
+    ELSE '0'
+  END AS "Bundled Pass"
+FROM
+  "tempc";
+  
+  
+###############Attribution###########################
+DROP TABLE "HMM_t2g_tempA1";
+CREATE LOCAL TEMPORARY TABLE "HMM_t2g_tempA1" AS
+SELECT
+  DISTINCT a.patient_id,
+  a.contextid,
+  CONCAT(b.lastname, ',', b.firstname) "Patient_name",
+  MAX(HbA1c) HbA1c,
+  f.resultvalue "HbA1c Result",
+  f.Resultdatetime AS HbA1c_Date_Satisfied,
+  MAX(BP) BP,
+  h.resultvalue AS "BP Result",
+  MAX(EyeExam) EyeExam,
+  MAX(Kidney) Kidney,
+  MAX("Bundled Pass") "Bundled Pass",
+  MAX("Bundled Complete") "Bundled Complete",
+  MAX(j.resultstatus) Statin,
+  b.enterpriseid,
+  b.DOB,
+  CASE
+    WHEN ContactPreference IS NOT NULL THEN ContactPreference
+    ELSE NULL
+  END AS "Contact Preference",
+  CASE
+    WHEN contactpreference = 'MOBILEPHONE' THEN MobilePhone
+    WHEN contactpreference = 'HOMEPHONE' THEN PatientHomePhone
+    WHEN contactpreference = 'WORKPHONE' THEN workphone
+  END AS "Phone Number",
+  consenttotextyn AS "Consent to Text",
+  e.NPI,
+  e."Provider Name",
+  PayerName AS "Payer Information",
+  e.LOB AS "LOB-Payer",
+  Attribution_Flag,
+  accountowner AS "Performance Consultant",
+  CASE
+    WHEN ptstatus IS NOT NULL THEN ptstatus
+    ELSE 'NA'
+  END AS "Satisfied AWV Flag",
+  CM_Flag,
+  past.appointmentdate AS Last_appt_date,
+  future.appointmentdate AS Next_appt_date,
+  future.schedulingprovider AS Next_appt_scheduling_provider,
+  CASE
+    WHEN e.Market IS NULL THEN z.market
+    ELSE e.market
+  END AS "Market",
+  PriviaPOD AS POD,
+  CASE
+    WHEN e."Care Center" IS NULL THEN z.ProviderGroupName
+    ELSE e."Care Center"
+  END AS "Care Center",
+  CASE
+    WHEN e.AccountAcronym IS NULL THEN ProviderGroupAcronym
+    ELSE e.AccountAcronym
+  END AS "AccountAcronym",
+  Territory
+FROM
+  "tempd" a
+  LEFT JOIN Athena.dbo.Patient b ON (a.patient_id = b.patientid)
+  AND (a.contextid = b.contextid)
+  LEFT JOIN (
+    SELECT
+      Enterpriseid,
+      t2.patientid,
+      t1.contextid,
+      MAX(appointmentdate) appointmentdate
+    FROM
+      athena.dbo.Appointment t1
+      LEFT JOIN athena.dbo.Patient t2 ON t2.patientid = t1.patientid
+      AND t2.contextid = t1.contextid
+    WHERE
+      appointmentstatus IN (
+        '2 - Checked In',
+        '3 - Checked Out',
+        '4 - Charge Entered'
+      )
+      AND (
+        DATEADD(YEAR, 2, appointmentdate) >= TO_TIMESTAMP_NTZ(CURRENT_TIMESTAMP())
+        OR schedulingprovider LIKE '%HFMG%'
+      )
+    GROUP BY
+      enterpriseid,
+      t2.patientid,
+      t1.contextid
+  ) past ON past.patientid = b.enterpriseid
+  AND past.contextid = a.contextid
+  LEFT JOIN (
+    SELECT
+      rn,
+      schedulingprovider,
+      appointmentdate,
+      patientid,
+      contextid
+    FROM
+      (
+        SELECT
+          enterpriseid,
+          t2.patientid,
+          schedulingprovider,
+          t1.contextid,
+          appointmentdate,
+          ROW_NUMBER() OVER (
+            PARTITION BY t2.patientid
+            ORDER BY
+              appointmentdate ASC
+          ) rn
+        FROM
+          athena.dbo.Appointment t1
+          LEFT JOIN athena.dbo.Patient t2 ON t2.patientid = t1.patientid
+          AND t2.contextid = t1.contextid
+        WHERE
+          appointmentstatus = 'f - Filled'
+          AND appointmentdate > TO_TIMESTAMP_NTZ(CURRENT_TIMESTAMP())
+      ) appt
+    WHERE
+      rn = 1
+  ) future ON future.patientid = b.enterpriseid
+  AND future.contextid = a.contextid
+  LEFT JOIN (
+    SELECT
+      DISTINCT patient_id,
+      contextid,
+      CASE
+        WHEN procedure_code IS NULL
+        OR other_modifier IS NULL THEN '0'
+        ELSE '1'
+      END AS "CM_Flag"
+    FROM
+      PriviaDataWarehouse.dbo.Claims_Denormalized_Daily
+    WHERE
+      PROCEDURE_CODE IN ('99490', '99491', 'G2058', '99487', '99489')
+      AND Other_Modifier = 'VEN'
+      AND Clm_From_dt between '2023-12-01' AND '2024-01-31'
+  ) c ON (a.patient_id = c.patient_id)
+  AND (a.contextid = c.ContextID)
+  LEFT JOIN (
+    SELECT
+      Athenaenterpriseid,
+      awvSatisfiedFlag,
+      contextid,
+      ptstatus
+    FROM
+      (
+        SELECT
+          *
+        FROM
+          (
+            SELECT
+              Athenaenterpriseid,
+              contextid,
+              awvSatisfiedFlag,
+              ptstatus,
+              MAX(msspAwvEligDate) EligDate,
+              ROW_NUMBER() OVER (
+                PARTITION BY athenaenterpriseid
+                ORDER BY
+                  athenaenterpriseid,
+                  awvSatisfiedFlag DESC
+              ) rn
+            FROM
+              PopHealthAnalytics.dbo.awvClaimsPtList
+            WHERE
+              latestFlag = 1
+            GROUP BY
+              athenaEnterpriseId,
+              awvSatisfiedFlag,
+              contextid,
+              msspAwvEligDate,
+              ptstatus
+          ) a
+        WHERE
+          rn = 1
+      ) b
+  ) i ON (b.enterpriseid = i.Athenaenterpriseid)
+  AND (b.contextid = i.contextid)
+  LEFT JOIN (
+    SELECT
+      *
+    FROM
+     analytics.dbo.diabetes_athena_extract
+    WHERE
+      "p4pmeasure" = 'Glycemic Status Assessment for Patients With Diabetes: Glycemic Status <8% (GSD1) (Adjusted, Uncertified)'
+  ) f ON (a.patient_id = f.patientid)
+  AND (a.contextid = f.contextid)
+  LEFT JOIN (
+    SELECT
+      *
+    FROM
+      analytics.dbo.diabetes_athena_extract
+    WHERE
+      "p4pmeasure" = 'Blood Pressure Control for Patients With Diabetes (BPD) (Adjusted, Uncertified)'
+  ) h ON (a.patient_id = h.patientid)
+  AND (a.contextid = h.contextid)
+  LEFT JOIN (
+    SELECT
+      DISTINCT patientid,
+      contextid,
+      resultstatus
+    FROM
+     analytics.dbo.diabetes_athena_extract
+     WHERE
+      "p4pmeasure" = 'Moderate or High Intensity Statin use and Lifestyle Therapy'
+  ) j ON CAST(a."patient_id" AS VARCHAR(200)) = j."patientid"
+  AND CAST(a.contextid AS VARCHAR(200)) = j.contextid
+  LEFT JOIN (
+    SELECT
+      *
+    FROM
+      (
+        SELECT
+          DISTINCT AthenaEnterpriseID,
+          FinalDataDefinedPCP AS "NPI",
+          attributionyearmonth,
+          PayerName,
+          CASE
+            WHEN "Provider Name" = ',' THEN NULL
+            ELSE "Provider Name"
+          END AS "Provider Name",
+          LOB,
+          Attribution_Flag,
+          accountowner,
+          contextid,
+          Market,
+          Priviapod AS POD,
+          AccountName AS "Care Center",
+          AccountAcronym,
+          Territory
+        FROM
+          (
+            SELECT
+              DISTINCT AthenaEnterpriseID,
+              FinalDataDefinedPCP,
+              lob,
+              attributionyearmonth,
+              PayerName,
+              CONCAT(ContactLastName, ',', ContactFirstName) AS "Provider Name",
+              a.contextid,
+              ROW_NUMBER() OVER (
+                PARTITION BY AthenaEnterpriseID
+                ORDER BY
+                  AttributionFILEDATE DESC
+              ) Attribution_Flag,
+              accountowner,
+              market,
+              d.priviapod,
+              Accountname,
+              AccountAcronym,
+              Territory
+            FROM
+              PriviaDataWarehouse.attribution.activeAttributions a
+              LEFT JOIN PriviaDataWarehouse.salesforce.Contacts b ON a.FinalDataDefinedPCP = b.ContactNPI
+              LEFT JOIN PriviaDataWarehouse.salesforce.ContactAccountCrosswalk c ON b.ContactID = c.ContactID
+              LEFT JOIN PriviaDataWarehouse.salesforce.Accounts d ON (c.AccountID = d.AccountID)
+              AND (a.contextid = d.contextid)
+              LEFT JOIN PriviaDataWarehouse.dim.Contracts e ON a.ContractID = e.ContractID
+            WHERE
+              AthenaEnterpriseID <> 0
+          ) d
+      ) a
+    WHERE
+      attribution_Flag = 1
+      AND "provider name" IS NOT NULL
+  ) e ON (b.enterpriseid = e.AthenaEnterpriseID)
+  AND (b.contextid = e.contextid)
+  LEFT JOIN analytics.dbo.AttributionMonthlyHierarchy z ON (e.npi = z.providernpi)
+GROUP BY
+  a.patient_id,
+  b.enterpriseid,
+  HbA1c,
+  BP,
+  EyeExam,
+  Kidney,
+  "Bundled Pass",
+  CM_Flag,
+  e.AthenaEnterpriseID,
+  PayerName,
+  i.Athenaenterpriseid,
+  i.contextid,
+  ptstatus,
+  past.appointmentdate,
+  future.appointmentdate,
+  future.schedulingprovider,
+  Attribution_Flag,
+  e.NPI,
+  e.PayerName,
+  f."SatisfiedDate",
+  b.lastname,
+  e."Provider Name",
+  e.contextid,
+  e.market,
+  e.AccountAcronym,
+  e.Territory,
+  e."Care Center",
+  z.market,
+  priviapod,
+  ProviderGroupName,
+  ProviderGroupAcronym,
+  PODMarketRegion,
+  b.firstname,
+  ContactPreference,
+  MobilePhone,
+  PatientHomePhone,
+  workphone,
+  e.lob,
+  f.resultvalue,
+  h.resultvalue,
+  consenttotextyn,
+  b.DOB,
+  a.contextid,
+  accountowner,
+  j.resultstatus;
+
+---subset the population
+drop table HMM_t2g_tempA2;
+CREATE LOCAL TEMPORARY TABLE HMM_t2g_tempA2 as
+select *
+from HMM_t2g_tempA1
+where attribution_flag is NULL
+
+
+----rendering provider
+DROP TABLE RENDERINGPROVIDER;
+CREATE LOCAL TEMPORARY TABLE "renderingprovider" AS
+SELECT
+  DISTINCT a."patient_id",
+  a.contextid,
+  g.npi,
+  g."providername",
+  g."Primary_Insurance_Package_Type",
+  g."lastname",
+  g."firstname",
+  Clm_From_dt,
+  specialty
+FROM
+  "HMM_t2g_tempA2" a
+  INNER JOIN (
+    SELECT
+      a.*,
+      Clm_From_dt,
+      Max_Clm_From_dt,
+      specialty
+    FROM
+      (
+        SELECT
+          DISTINCT "patientid",
+          contextid,
+          providernpinumber as npi,
+          "providername",
+          "insurancepackagename" as Primary_Insurance_Package_Type,
+          "lastname",
+          "firstname"
+        FROM
+          analytics.dbo.diabetes_athena_extract
+      ) a
+      LEFT JOIN (
+        SELECT
+          *
+        FROM
+          (
+            SELECT
+              DISTINCT *,
+              ROW_NUMBER() OVER (
+                PARTITION BY patient_id
+                ORDER BY
+                  Clm_From_dt DESC
+              ) Max_Clm_From_dt
+            FROM
+              PriviaDataWarehouse.dbo.Claims_Denormalized_Daily
+          ) claims
+      ) b ON a."patientid" = b.patient_id
+      AND a.contextid = b.contextid
+      AND a.npi = b.pro_npi
+    WHERE
+      Clm_From_dt between '2022-08-01' and '2024-02-29'
+  ) g ON g."patientid" = a."patient_id"
+  AND g.contextid = a.contextid
+WHERE
+  a.attribution_flag IS NULL
+ORDER BY
+  Clm_From_dt DESC;
+  
+  select * from RENDERINGPROVIDER
+
+DROP TABLE LASTRENDERINGPROVIDER;
+CREATE LOCAL TEMPORARY TABLE "lastrenderingprovider" AS
+SELECT
+  DISTINCT a."patient_id",
+  a.contextid,
+  "Primary_Insurance_Package_Type",
+  "provider name",
+  a.npi,
+  a."firstname",
+  a."lastname",
+  specialty,
+  Clm_From_dt,
+  e.market,
+  b.PriviaPOD,
+  ProviderGroupName AS carecenter,
+  ProviderGroupAcronym,
+  e.PODMarketRegion,
+  NULL AccountOwner,
+  '0' Attribution_Flag
+FROM
+  (
+    SELECT
+      DISTINCT a."patient_id",
+      a.contextid,
+      "Primary_Insurance_Package_Type",
+      "firstname",
+      "lastname",
+      specialty,
+      Clm_From_dt,
+      CASE
+        WHEN specialty = 'Internal Medicine'
+        OR specialty = 'Family Medicine' THEN npi
+        WHEN specialty = 'Endocrinology' THEN npi
+        ELSE npi
+      END AS "NPI",
+      CASE
+        WHEN specialty = 'Internal Medicine'
+        OR specialty = 'Family Medicine' THEN "providername"
+        WHEN specialty = 'Endocrinology' THEN "providername"
+        ELSE "providername"
+      END AS "provider name",
+      ROW_NUMBER() OVER (
+        PARTITION BY "patient_id"
+        ORDER BY
+          Clm_From_dt DESC
+      ) Max_Clm_From_dt
+    FROM
+      "renderingprovider" a
+  ) a
+  LEFT JOIN PriviaDataWarehouse.salesforce.Contacts b ON npi = b.ContactNPI
+  LEFT JOIN PriviaDataWarehouse.salesforce.ContactAccountCrosswalk c ON b.ContactID = c.ContactID
+  LEFT JOIN PriviaDataWarehouse.salesforce.Accounts d ON (c.AccountID = d.AccountID)
+  AND (a.contextid = d.contextid)
+  LEFT JOIN analytics.dbo.AttributionMonthlyHierarchy e ON a.npi = e.providernpi
+WHERE
+  Max_Clm_From_dt = 1;
+
+------update table
+UPDATE
+  HMM_t2g_tempA2
+SET
+   HMM_t2g_tempA2.npi = lastrenderingprovider.npi
+FROM
+  "lastrenderingprovider"
+WHERE
+  HMM_t2g_tempA2.patient_id = lastrenderingprovider.patient_id
+  AND HMM_t2g_tempA2.contextid = lastrenderingprovider.contextid;
+ 
+ UPDATE
+  HMM_t2g_tempA2
+SET
+   HMM_t2g_tempA2."provider name" = lastrenderingprovider."provider name"
+FROM
+  "lastrenderingprovider"
+WHERE
+  HMM_t2g_tempA2.patient_id = lastrenderingprovider.patient_id
+  AND HMM_t2g_tempA2.contextid = lastrenderingprovider.contextid;
+
+ UPDATE
+  HMM_t2g_tempA2
+SET
+   HMM_t2g_tempA2."Payer Information" = lastrenderingprovider.Primary_Insurance_Package_Type
+FROM
+  "lastrenderingprovider"
+WHERE
+  HMM_t2g_tempA2.patient_id = lastrenderingprovider.patient_id
+  AND HMM_t2g_tempA2.contextid = lastrenderingprovider.contextid;
+
+ UPDATE
+  HMM_t2g_tempA2
+SET
+   HMM_t2g_tempA2.market = lastrenderingprovider.market
+FROM
+  "lastrenderingprovider"
+WHERE
+  HMM_t2g_tempA2.patient_id = lastrenderingprovider.patient_id
+  AND HMM_t2g_tempA2.contextid = lastrenderingprovider.contextid;
+ 
+  UPDATE
+  HMM_t2g_tempA2
+SET
+   HMM_t2g_tempA2.POD = lastrenderingprovider.PriviaPOD
+FROM
+  "lastrenderingprovider"
+WHERE
+  HMM_t2g_tempA2.patient_id = lastrenderingprovider.patient_id
+  AND HMM_t2g_tempA2.contextid = lastrenderingprovider.contextid;
+  
+  UPDATE
+  HMM_t2g_tempA2
+SET
+   HMM_t2g_tempA2."care center" = lastrenderingprovider.carecenter
+FROM
+  "lastrenderingprovider"
+WHERE
+  HMM_t2g_tempA2.patient_id = lastrenderingprovider.patient_id
+  AND HMM_t2g_tempA2.contextid = lastrenderingprovider.contextid;  
+  
+  UPDATE
+  HMM_t2g_tempA2
+SET
+   HMM_t2g_tempA2.AccountAcronym = lastrenderingprovider.PROVIDERGROUPACRONYM
+FROM
+  "lastrenderingprovider"
+WHERE
+  HMM_t2g_tempA2.patient_id = lastrenderingprovider.patient_id
+  AND HMM_t2g_tempA2.contextid = lastrenderingprovider.contextid;
+ 
+   UPDATE
+  HMM_t2g_tempA2
+SET
+   HMM_t2g_tempA2.territory = lastrenderingprovider.PODMARKETREGION
+FROM
+  "lastrenderingprovider"
+WHERE
+  HMM_t2g_tempA2.patient_id = lastrenderingprovider.patient_id
+  AND HMM_t2g_tempA2.contextid = lastrenderingprovider.contextid;
+ 
+    UPDATE
+  HMM_t2g_tempA2
+SET
+   HMM_t2g_tempA2."Performance Consultant" = lastrenderingprovider.AccountOwner
+FROM
+  "lastrenderingprovider"
+WHERE
+  HMM_t2g_tempA2.patient_id = lastrenderingprovider.patient_id
+  AND HMM_t2g_tempA2.contextid = lastrenderingprovider.contextid;
+  
+     UPDATE
+  HMM_t2g_tempA2
+SET
+   HMM_t2g_tempA2.Attribution_Flag = lastrenderingprovider.Attribution_Flag
+FROM
+  "lastrenderingprovider"
+WHERE
+  HMM_t2g_tempA2.patient_id = lastrenderingprovider.patient_id
+  AND HMM_t2g_tempA2.contextid = lastrenderingprovider.contextid;
+
+DROP TABLE  HMM_t2g_tempA3;
+CREATE LOCAL TEMPORARY TABLE HMM_t2g_tempA3 as 
+select * from HMM_t2g_tempA2 where npi is NOT null OR MARKET IS NOT NULL
+
+DROP TABLE HMM_t2g_tempA4;
+CREATE TEMPORARY TABLE HMM_t2g_tempA4 AS
+SELECT
+  Patient_id AS Patientid,
+  Enterpriseid,
+  contextid,
+  Patient_name,
+  DOB,
+  "Contact Preference",
+  "Phone Number",
+  "Consent to Text",
+  HbA1C,
+  HbA1c_Date_Satisfied,
+  "HbA1c Result",
+  BP,
+  "BP Result",
+  EyeExam,
+  Kidney,
+  "Bundled Complete", 
+  "Bundled Pass",
+  Statin,
+  NPI,
+  "Provider Name",
+  "Payer Information",
+  "LOB-Payer",
+  "Performance Consultant",
+  Attribution_Flag,
+  "Satisfied AWV Flag",
+  CM_Flag,
+  Next_appt_date,
+  Next_appt_scheduling_provider,
+  Last_appt_date,
+  Market,
+  POD,
+  "Care Center",
+  AccountAcronym,
+  Territory
+FROM
+  (
+    SELECT
+      *
+    FROM
+      HMM_t2g_tempA1
+    WHERE
+      Attribution_Flag = 1
+  ) a
+UNION
+SELECT
+  Patient_id AS Patientid,
+  Enterpriseid,
+  contextid,
+  Patient_name,
+  DOB,
+  "Contact Preference",
+  "Phone Number",
+  "Consent to Text",
+  HbA1C,
+  HbA1c_Date_Satisfied,
+  "HbA1c Result",
+  BP,
+  "BP Result",
+  EyeExam,
+  Kidney,
+  "Bundled Complete", 
+  "Bundled Pass",
+  Statin,
+  NPI,
+  "Provider Name",
+  "Payer Information",
+  "LOB-Payer",
+  "Performance Consultant",
+  Attribution_Flag,
+  "Satisfied AWV Flag",
+  CM_Flag,
+  Next_appt_date,
+  Next_appt_scheduling_provider,
+  Last_appt_date,
+  Market,
+  POD,
+  "Care Center",
+  AccountAcronym,
+  Territory
+FROM
+  HMM_t2g_tempA3;
+ 
+ drop table hMM_t2g_tempA5;
+ CREATE TEMPORARY TABLE  HMM_t2g_tempA5 AS
+ select *
+ from (
+ SELECT A.*, BUNDLED_COMPLETE_TARGET,BUNDLED_PASS_TARGET,HBA1C_TARGET, BP_TARGET, KIDNEY_TARGET, EYE_EXAM_TARGET,  CAST(
+        SUBSTRING(
+            LEFT(CAST(DATEADD(DAY, -2, SYSDATE()) AS VARCHAR), 8)
+            , 1
+            , 7
+        ) || '-01'  AS DATE
+    ) rptMonth,
+  SYSDATE() refreshDate,
+  ROW_NUMBER() OVER (
+            PARTITION BY  enterpriseid
+            ORDER BY
+             cast (patientid AS INT) asc
+          ) rn
+ FROM HMM_t2g_tempA4 a
+ INNER JOIN  (SELECT * FROM analytics.dbo.diabetes_target_values) b
+ on a.market = b.market)
+ where rn = 1
+ order by PATIENTID ASC
